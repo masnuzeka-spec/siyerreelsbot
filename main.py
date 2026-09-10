@@ -5,7 +5,6 @@ import threading
 import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from google import genai
-from youtube_transcript_api import YouTubeTranscriptApi
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -15,7 +14,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Render portunu canlı tutan sunucu
+# Render kapanmasın diye port dinleyici
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -28,39 +27,62 @@ def run_fake_web_server():
     server.serve_forever()
 
 def extract_video_id(url):
-    """Linkten YouTube Video ID'sini çeker."""
     match = re.search(r"(?:v=|\/live\/|youtu\.be\/)([0-9A-Za-z_-]{11})", url)
     return match.group(1) if match else None
 
-def get_transcript_fast(video_id):
-    """Videonun Türkçe transkriptini çeker."""
-    try:
-        data = YouTubeTranscriptApi.get_transcript(video_id, languages=['tr'])
-    except Exception:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = transcript_list.find_generated_transcript(['tr'])
-        data = transcript.fetch()
+def get_transcript_via_ytdlp(video_id):
+    """Harici kütüphane kullanmadan doğrudan yt-dlp ile Türkçe altyazıyı çeker."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--write-auto-sub",
+        "--write-sub",
+        "--sub-lang", "tr",
+        "--sub-format", "json3",
+        "-o", "subs.%(ext)s",
+        "--force-overwrites",
+        url
+    ]
+    subprocess.run(cmd, check=True)
+    
+    sub_file = "subs.tr.json3"
+    if not os.path.exists(sub_file):
+        raise Exception("Bu videoda Türkçe altyazı veya otomatik altyazı bulunamadı.")
+
+    with open(sub_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Geçici altyazı dosyasını sil
+    os.remove(sub_file)
 
     formatted_segments = []
-    for item in data:
-        formatted_segments.append({
-            "start": round(item["start"], 1),
-            "end": round(item["start"] + item["duration"], 1),
-            "text": item["text"]
-        })
+    events = data.get("events", [])
+    for ev in events:
+        if "segs" in ev and "tStartMs" in ev:
+            text = "".join([s.get("utf8", "") for s in ev["segs"]]).strip()
+            if text and text != "\n":
+                start_sec = round(ev["tStartMs"] / 1000.0, 1)
+                duration_sec = round(ev.get("dDurationMs", 2000) / 1000.0, 1)
+                formatted_segments.append({
+                    "start": start_sec,
+                    "end": round(start_sec + duration_sec, 1),
+                    "text": text
+                })
+
     return formatted_segments
 
 def find_best_segment(transcript_segments):
-    """Gemini ile en etkileyici 35-50 saniyelik aralığı seçer."""
+    """Gemini ile en etkileyici 35-50 saniyelik aralığı bulur."""
     prompt = f"""
-    Sen tecrübeli bir sosyal medya editörüsün. Aşağıdaki transkript Siyer Vakfı videosuna aittir.
-    Instagram Reels formatına en uygun, çarpıcı, düşündürücü, duygu yoğunluğu yüksek ve tek başına dinlendiğinde anlamlı olan 35-50 saniyelik kesiti seç.
+    Sen tecrübeli bir sosyal medya editörüsün. Aşağıdaki metin Siyer Vakfı dersine aittir.
+    Instagram Reels formatına en uygun, çarpıcı, öğüt verici, duygu yoğunluğu yüksek ve tek başına dinlendiğinde anlamlı olan 35-50 saniyelik kesiti seç.
 
-    Transkript:
-    {json.dumps(transcript_segments[:600], ensure_ascii=False)}
+    Transkript parçaları:
+    {json.dumps(transcript_segments[:500], ensure_ascii=False)}
 
     SADECE şu JSON şablonunda cevap ver:
-    {{"start": 120.0, "end": 165.0, "reason": "Kesitin seçilme gerekçesi"}}
+    {{"start": 120.0, "end": 165.0, "reason": "Kesitin seçilme sebebi"}}
     """
     response = gemini_client.models.generate_content(
         model="gemini-2.5-flash",
@@ -70,7 +92,7 @@ def find_best_segment(transcript_segments):
     return json.loads(response.text)
 
 def download_and_crop(video_id, start, end, output_filename="reels.mp4"):
-    """Sadece o aralığı Android kimliğiyle indirip 9:16 dikey kırpar."""
+    """Videonun o aralığını dikey (9:16) formatta indirir."""
     if os.path.exists(output_filename):
         os.remove(output_filename)
 
@@ -101,11 +123,11 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Geçerli bir YouTube linki tespit edilemedi kral.")
         return
 
-    status_msg = await update.message.reply_text("⚡ Konuşma metni taranıyor...")
+    status_msg = await update.message.reply_text("⚡ Konuşma metni doğrudan YouTube'dan çekiliyor...")
     
     try:
-        # 1. Hızlı Altyazı
-        segments = get_transcript_fast(video_id)
+        # 1. Altyazı çekme
+        segments = get_transcript_via_ytdlp(video_id)
         await status_msg.edit_text("🤖 Gemini en etkili kesiti seçiyor...")
         
         # 2. Vurucu Kesiti Bulma
@@ -138,5 +160,5 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_url))
-    print("Bot hazır ve dinliyor...")
+    print("Bot dinliyor...")
     app.run_polling()
