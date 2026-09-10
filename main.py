@@ -3,6 +3,7 @@ import re
 import json
 import threading
 import subprocess
+import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from groq import Groq
 from google import genai
@@ -17,12 +18,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Render'ı uyanık tutan sunucu
+# Render uyku moduna geçmesin diye sahte web sunucusu
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Aktif!")
+        self.wfile.write(b"Bot Aktif ve YouTube'u By-Pass Ediyor!")
 
 def run_fake_web_server():
     port = int(os.getenv("PORT", 8080))
@@ -33,43 +34,64 @@ def extract_video_id(url):
     match = re.search(r"(?:v=|\/live\/|youtu\.be\/)([0-9A-Za-z_-]{11})", url)
     return match.group(1) if match else None
 
-def get_audio_and_transcribe(video_id):
-    """Sesi YouTube bot engeline takılmadan Android kimliğiyle indirir ve Groq ile çözer."""
+def get_direct_urls(video_id):
+    """yt-dlp KULLANMADAN, Piped API ile YouTube IP engellerini tamamen aşar."""
+    instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.tokhmi.xyz",
+        "https://api.piped.projectsegfau.lt"
+    ]
+    for inst in instances:
+        try:
+            r = requests.get(f"{inst}/streams/{video_id}", timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                
+                # Hem ses hem görüntü içeren (muxed) en iyi linki bul
+                video_streams = [s for s in data.get("videoStreams", []) if not s.get("videoOnly", False)]
+                if video_streams:
+                    video_streams.sort(key=lambda x: int(x.get("quality", "0").replace("p", "")), reverse=True)
+                    video_url = video_streams[0]["url"]
+                else:
+                    video_url = data.get("videoStreams", [{}])[0].get("url")
+                    
+                audio_streams = data.get("audioStreams", [])
+                audio_url = audio_streams[0]["url"] if audio_streams else video_url
+                
+                if video_url and audio_url:
+                    return video_url, audio_url
+        except Exception:
+            continue
+    raise Exception("Piped API sunucuları yanıt vermedi. YouTube geçici bir engelleme yapıyor olabilir.")
+
+def download_audio_and_transcribe(audio_url):
+    """Doğrudan ham linkten FFmpeg ile sesi indirip Groq Whisper'a verir."""
     audio_file = "temp_audio.m4a"
     if os.path.exists(audio_file):
         os.remove(audio_file)
-
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    # YouTube bot korumasını aşan istemci parametresi
+        
     cmd = [
-        "yt-dlp",
-        "--extractor-args", "youtube:player_client=android_creator,android",
-        "-x",
-        "--audio-format", "m4a",
-        "-o", audio_file,
-        "--force-overwrites",
-        url
+        "ffmpeg", "-y",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-i", audio_url,
+        "-vn", "-c:a", "aac", "-b:a", "64k",
+        audio_file
     ]
-    subprocess.run(cmd, check=True)
-
-    # Groq Whisper ile sesi metne dönüştür
+    # Sesi hızlıca indir (Video çok uzun olsa bile ses çok ufaktır, Render'ı yormaz)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
     with open(audio_file, "rb") as f:
         transcription = groq_client.audio.transcriptions.create(
             file=(audio_file, f.read()),
             model="whisper-large-v3",
             response_format="verbose_json"
         )
-    
-    # İşi biten ses dosyasını sil
-    if os.path.exists(audio_file):
-        os.remove(audio_file)
-
+        
+    os.remove(audio_file)
     return transcription.segments
 
 def find_best_segment(transcript_segments):
-    """Gemini ile en vurucu 35-50 saniyelik kesiti bulur."""
-    # Metin parçalarını kompakt hale getir
+    """Gemini 2.5 Flash ile 40 saniyelik en can alıcı kesiti seçer."""
     condensed = [{"start": round(s["start"], 1), "end": round(s["end"], 1), "text": s["text"]} for s in transcript_segments[:500]]
     
     prompt = f"""
@@ -89,29 +111,30 @@ def find_best_segment(transcript_segments):
     )
     return json.loads(response.text)
 
-def download_and_crop(video_id, start, end, output_filename="reels.mp4"):
-    """Sadece seçilen aralığı dikey (9:16) formatta indirir."""
+def download_and_crop_video(video_url, start, end, output_filename="reels.mp4"):
+    """Videonun tamamını indirmeden, SADECE seçilen saniyeleri bulur ve dikey olarak kaydeder."""
     if os.path.exists(output_filename):
         os.remove(output_filename)
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    duration = end - start
     filter_complex = "crop=ih*(9/16):ih,scale=1080:1920"
     
     cmd = [
-        "yt-dlp",
-        "--extractor-args", "youtube:player_client=android_creator,android",
-        "--download-sections", f"*{start}-{end}",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4/best",
-        "--postprocessor-args", f"ffmpeg:-vf {filter_complex}",
-        "-o", output_filename,
-        "--force-overwrites",
-        url
+        "ffmpeg", "-y",
+        "-user_agent", "Mozilla/5.0",
+        "-ss", str(start),
+        "-i", video_url,
+        "-t", str(duration),
+        "-vf", filter_complex,
+        "-c:v", "libx264", "-preset", "fast",
+        "-c:a", "aac",
+        output_filename
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return output_filename
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Selamlar Kral! Siyer Vakfı video linkini gönder, en etkileyici kesiti hemen dikey Reels yapayım.")
+    await update.message.reply_text("Selamlar Kral! Siyer Vakfı video linkini gönder, en etkileyici kesiti hemen dikey Reels yapayım. (yt-dlp engelleri tamamen kaldırıldı!)")
 
 async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_url = update.message.text.strip()
@@ -121,25 +144,29 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Geçerli bir YouTube linki tespit edilemedi kral.")
         return
 
-    status_msg = await update.message.reply_text("🎙️ Ses indiriliyor ve Groq Whisper ile dinleniyor...")
+    status_msg = await update.message.reply_text("⚡ Güvenlik kalkanları aşılıyor, doğrudan YouTube medya sunucularına bağlanılıyor...")
     
     try:
-        # 1. Groq ile doğrudan sesi dinleyip metne dökme
-        segments = get_audio_and_transcribe(video_id)
+        # 1. IP engelini aşan temiz linkleri al
+        video_url, audio_url = get_direct_urls(video_id)
+        await status_msg.edit_text("🎙️ Ses indiriliyor ve Groq Whisper ile dinleniyor...")
+        
+        # 2. Sesi indir ve Transkript al
+        segments = download_audio_and_transcribe(audio_url)
         await status_msg.edit_text("🤖 Gemini en etkili kesiti seçiyor...")
         
-        # 2. Vurucu Kesiti Bulma
+        # 3. En iyi yeri bul
         best = find_best_segment(segments)
         start = float(best["start"])
         end = float(best["end"])
         reason = best.get("reason", "Öne çıkan bölüm")
         
-        await status_msg.edit_text(f"✂️ Dikey Reels hazırlanıyor ({int(end - start)} sn)...")
+        await status_msg.edit_text(f"✂️ Sadece hedef saniyeler ({int(end - start)} sn) dikey olarak kırpılıyor...")
         
-        # 3. Kesme ve Dikey Yapma
-        output_file = download_and_crop(video_id, start, end)
+        # 4. Kes ve Dikey Yap (Hızlı Mod)
+        output_file = download_and_crop_video(video_url, start, end)
         
-        # 4. Telegram'a Gönderme
+        # 5. Telegram'a Gönder
         caption = f"🎬 **Reels Kesiti Hazır!**\n\n📌 Süre: {int(end - start)} sn\n💡 Vurgu: {reason}"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🚀 Instagram'da Paylaş", callback_data="share")],
@@ -158,5 +185,5 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_url))
-    print("Bot hazır ve dinliyor...")
+    print("Bot dinliyor (Piped API By-Pass devrede)...")
     app.run_polling()
