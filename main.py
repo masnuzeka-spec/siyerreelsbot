@@ -15,7 +15,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Render'ın açık kalmasını sağlayan port dinleyici
+# Render portunu canlı tutan sunucu
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -33,18 +33,14 @@ def extract_video_id(url):
     return match.group(1) if match else None
 
 def get_transcript_fast(video_id):
-    """Videonun sesini indirmeden, doğrudan YouTube altyazı motorundan metni çeker."""
-    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-    
-    # Öncelikli olarak Türkçe transkripti al
+    """Videonun Türkçe transkriptini çeker."""
     try:
-        transcript = transcript_list.find_transcript(['tr'])
-    except:
-        # Otomatik oluşturulmuş Türkçe altyazıyı dene
+        data = YouTubeTranscriptApi.get_transcript(video_id, languages=['tr'])
+    except Exception:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         transcript = transcript_list.find_generated_transcript(['tr'])
-        
-    data = transcript.fetch()
-    
+        data = transcript.fetch()
+
     formatted_segments = []
     for item in data:
         formatted_segments.append({
@@ -55,8 +51,7 @@ def get_transcript_fast(video_id):
     return formatted_segments
 
 def find_best_segment(transcript_segments):
-    """Gemini ile en etkileyici 35-50 saniyelik aralığı tespit eder."""
-    # Metin çok uzunsa ortalama bir özet context gönderiyoruz
+    """Gemini ile en etkileyici 35-50 saniyelik aralığı seçer."""
     prompt = f"""
     Sen tecrübeli bir sosyal medya editörüsün. Aşağıdaki transkript Siyer Vakfı videosuna aittir.
     Instagram Reels formatına en uygun, çarpıcı, düşündürücü, duygu yoğunluğu yüksek ve tek başına dinlendiğinde anlamlı olan 35-50 saniyelik kesiti seç.
@@ -75,14 +70,13 @@ def find_best_segment(transcript_segments):
     return json.loads(response.text)
 
 def download_and_crop(video_id, start, end, output_filename="reels.mp4"):
-    """Sadece o 40 saniyelik aralığı Android kimliğiyle (bot engeline takılmadan) indirip dikey yapar."""
+    """Sadece o aralığı Android kimliğiyle indirip 9:16 dikey kırpar."""
     if os.path.exists(output_filename):
         os.remove(output_filename)
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    # YouTube bot engelini aşan android istemci argümanı + FFmpeg dikey kırpma
     filter_complex = "crop=ih*(9/16):ih,scale=1080:1920"
+    
     cmd = [
         "yt-dlp",
         "--extractor-args", "youtube:player_client=android",
@@ -107,7 +101,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Geçerli bir YouTube linki tespit edilemedi kral.")
         return
 
-    status_msg = await update.message.reply_text("⚡ Konuşma metni taranıyor (ses indirmeden hızlı mod)...")
+    status_msg = await update.message.reply_text("⚡ Konuşma metni taranıyor...")
     
     try:
         # 1. Hızlı Altyazı
@@ -122,7 +116,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await status_msg.edit_text(f"✂️ Dikey Reels hazırlanıyor ({int(end - start)} sn)...")
         
-        # 3. Kesme ve Dikey Yapma (Android Client ile)
+        # 3. Kesme ve Dikey Yapma
         output_file = download_and_crop(video_id, start, end)
         
         # 4. Telegram'a Gönderme
