@@ -1,0 +1,5 @@
+yt-dlp
+groq
+google-genai
+requests
+python-telegram-bot
