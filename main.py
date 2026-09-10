@@ -1,15 +1,14 @@
 import os
+import re
 import json
-import subprocess
-import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from groq import Groq
 from google import genai
+import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Çevre Değişkenleri
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -18,7 +17,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Render'ın "Application exited" hatası vermemesi için arka plan web sunucusu
+# Render kapanmasın diye basit HTTP sunucusu
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -30,24 +29,46 @@ def run_fake_web_server():
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
     server.serve_forever()
 
+def clean_youtube_url(url):
+    """Linkteki /live/ veya takip kodlarını standart video formatına çevirir."""
+    video_id_match = re.search(r"(?:v=|\/live\/|youtu\.be\/)([0-9A-Za-z_-]{11})", url)
+    if video_id_match:
+        return f"https://www.youtube.com/watch?v={video_id_match.group(1)}"
+    return url
+
 def get_audio_and_transcript(youtube_url):
-    """Videonun yalnızca sesini hafif formatta indirir ve Groq Whisper ile çözer."""
-    if os.path.exists("temp_audio.m4a"):
-        os.remove("temp_audio.m4a")
-        
-    cmd_audio = f'yt-dlp -x --audio-format m4a -o "temp_audio.%(ext)s" "{youtube_url}"'
-    subprocess.run(cmd_audio, shell=True, check=True)
+    """Videonun sesini doğrudan yt_dlp kütüphanesiyle indirir ve transkript alır."""
+    cleaned_url = clean_youtube_url(youtube_url)
+    audio_file = "temp_audio.m4a"
     
-    with open("temp_audio.m4a", "rb") as f:
+    if os.path.exists(audio_file):
+        os.remove(audio_file)
+
+    ydl_opts = {
+        'format': 'm4a/bestaudio/best',
+        'outtmpl': 'temp_audio.%(ext)s',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'm4a',
+        }],
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
+        'quiet': True,
+        'no_warnings': True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([cleaned_url])
+
+    with open(audio_file, "rb") as f:
         transcription = groq_client.audio.transcriptions.create(
-            file=("temp_audio.m4a", f.read()),
+            file=(audio_file, f.read()),
             model="whisper-large-v3",
             response_format="verbose_json"
         )
-    return transcription
+    return transcription, cleaned_url
 
 def find_best_segment(transcript_segments):
-    """Gemini ile en etkileyici 35-50 saniyelik aralığı bulur."""
+    """Gemini ile en etkileyici 35-50 saniyelik kesiti seçer."""
     prompt = f"""
     Sen usta bir sosyal medya editörüsün. Aşağıdaki metin Siyer Vakfı dersine aittir.
     Instagram Reels formatına en uygun, çarpıcı, düşündürücü, duygu yoğunluğu yüksek ve bağımsız 35-50 saniyelik aralığı bul.
@@ -56,7 +77,7 @@ def find_best_segment(transcript_segments):
     {json.dumps(transcript_segments, ensure_ascii=False)}
 
     SADECE şu JSON şablonunda cevap ver:
-    {{"start": 120.0, "end": 165.0, "reason": "Kesitin çarpıcı olma sebebi"}}
+    {{"start": 120.0, "end": 165.0, "reason": "Kesitin seçilme sebebi"}}
     """
     response = gemini_client.models.generate_content(
         model="gemini-2.5-flash",
@@ -66,48 +87,54 @@ def find_best_segment(transcript_segments):
     return json.loads(response.text)
 
 def process_and_crop(youtube_url, start, end, output_filename="reels.mp4"):
-    """Videonun seçilen aralığını dikey (9:16) formatta indirir."""
+    """Videonun sadece seçilen aralığını dikey (9:16) formatta kaydeder."""
     if os.path.exists(output_filename):
         os.remove(output_filename)
-        
-    filter_complex = "crop=ih*(9/16):ih,scale=1080:1920"
-    cmd = (
-        f'yt-dlp -ss {start} -to {end} "{youtube_url}" '
-        f'-f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4" '
-        f'--postprocessor-args "ffmpeg:-vf {filter_complex}" '
-        f'-o "{output_filename}" --force-overwrites'
-    )
-    subprocess.run(cmd, shell=True, check=True)
+
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4/best',
+        'outtmpl': output_filename,
+        'download_ranges': yt_dlp.utils.download_range_func(None, [(start, end)]),
+        'force_keyframes_at_cuts': True,
+        'postprocessor_args': {
+            'ffmpeg': ['-vf', 'crop=ih*(9/16):ih,scale=1080:1920']
+        },
+        'quiet': True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([youtube_url])
+
     return output_filename
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Selamlar Kral! Bana analiz etmemi istediğin Siyer Vakfı YouTube video linkini at, hemen en vurucu Reels kesitini hazırlayayım.")
+    await update.message.reply_text("Selamlar Kral! Analiz edilmesini istediğin Siyer Vakfı video linkini gönder, en etkili kesiti hemen hazırlayayım.")
 
 async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if "youtube.com" not in url and "youtu.be" not in url:
-        await update.message.reply_text("Lütfen geçerli bir YouTube video linki gönder kral.")
+    raw_url = update.message.text.strip()
+    if "youtube.com" not in raw_url and "youtu.be" not in raw_url:
+        await update.message.reply_text("Lütfen geçerli bir YouTube linki gönder kral.")
         return
 
-    status_msg = await update.message.reply_text("⏳ Video taranıyor, ses transkripti çıkarılıyor...")
+    status_msg = await update.message.reply_text("⏳ Ses çıkarılıyor ve transkript hazırlanıyor...")
     
     try:
-        # 1. Transkript
-        transcription = get_audio_and_transcript(url)
-        await status_msg.edit_text("🤖 Gemini en etkili kesiti tespit ediyor...")
+        # 1. Temiz URL & Transkript
+        transcription, clean_url = get_audio_and_transcript(raw_url)
+        await status_msg.edit_text("🤖 Gemini en etkili kesiti seçiyor...")
         
-        # 2. Vurucu kesiti bulma
+        # 2. Vurucu Kesiti Bulma
         segment = find_best_segment(transcription.segments)
-        start = segment["start"]
-        end = segment["end"]
-        reason = segment.get("reason", "Öne çıkan bölüm")
+        start = float(segment["start"])
+        end = float(segment["end"])
+        reason = segment.get("reason", "Öne çıkan kesit")
         
-        await status_msg.edit_text(f"✂️ Dikey Reels videosu kesiliyor ({int(end - start)} sn)...")
+        await status_msg.edit_text(f"✂️ Dikey Reels hazırlanıyor ({int(end - start)} sn)...")
         
         # 3. Kırpma
-        output_file = process_and_crop(url, start, end)
+        output_file = process_and_crop(clean_url, start, end)
         
-        # 4. Telegram'a gönderme
+        # 4. Telegram'a Gönderme
         caption = f"🎬 **Reels Kesiti Hazır!**\n\n📌 Süre: {int(end - start)} sn\n💡 Vurgu: {reason}"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🚀 Instagram'da Paylaş", callback_data="share")],
@@ -122,13 +149,9 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Bir hata oluştu:\n{str(e)}")
 
 if __name__ == "__main__":
-    # 1. Render için HTTP sunucusunu arka planda başlat
     threading.Thread(target=run_fake_web_server, daemon=True).start()
-    
-    # 2. Telegram Botunu başlat ve sürekli dinle
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_url))
-    
-    print("Bot basariyla baslatildi ve dinliyor...")
+    print("Bot hazır ve dinliyor...")
     app.run_polling()
