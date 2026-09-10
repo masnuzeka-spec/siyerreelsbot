@@ -3,25 +3,26 @@ import re
 import json
 import threading
 import subprocess
-import requests
-from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from groq import Groq
 from google import genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+groq_client = Groq(api_key=GROQ_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Render portunu canlı tutan HTTP sunucusu
+# Render'ı uyanık tutan sunucu
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot 7/24 Aktif!")
+        self.wfile.write(b"Bot Aktif!")
 
 def run_fake_web_server():
     port = int(os.getenv("PORT", 8080))
@@ -32,60 +33,51 @@ def extract_video_id(url):
     match = re.search(r"(?:v=|\/live\/|youtu\.be\/)([0-9A-Za-z_-]{11})", url)
     return match.group(1) if match else None
 
-def get_transcript_direct(video_id):
-    """yt-dlp kullanmadan doğrudan YouTube web sayfasından altyazıyı çeker."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    r = requests.get(f"https://www.youtube.com/watch?v={video_id}", headers=headers)
+def get_audio_and_transcribe(video_id):
+    """Sesi YouTube bot engeline takılmadan Android kimliğiyle indirir ve Groq ile çözer."""
+    audio_file = "temp_audio.m4a"
+    if os.path.exists(audio_file):
+        os.remove(audio_file)
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
     
-    # Sayfa içindeki captionTracks URL'sini bul
-    matches = re.findall(r'"captionTracks":\s*(\[.*?\])', r.text)
-    if not matches:
-        raise Exception("Bu videoda henüz altyazı bulunmuyor veya YouTube kısıtladı.")
+    # YouTube bot korumasını aşan istemci parametresi
+    cmd = [
+        "yt-dlp",
+        "--extractor-args", "youtube:player_client=android_creator,android",
+        "-x",
+        "--audio-format", "m4a",
+        "-o", audio_file,
+        "--force-overwrites",
+        url
+    ]
+    subprocess.run(cmd, check=True)
+
+    # Groq Whisper ile sesi metne dönüştür
+    with open(audio_file, "rb") as f:
+        transcription = groq_client.audio.transcriptions.create(
+            file=(audio_file, f.read()),
+            model="whisper-large-v3",
+            response_format="verbose_json"
+        )
     
-    caption_tracks = json.loads(matches[0])
-    
-    # Varsa Türkçe, yoksa ilk altyazı kanalını seç
-    selected_track = None
-    for track in caption_tracks:
-        if track.get("languageCode") == "tr":
-            selected_track = track
-            break
-    if not selected_track:
-        selected_track = caption_tracks[0]
-        
-    caption_url = selected_track["baseUrl"]
-    sub_res = requests.get(caption_url, headers=headers)
-    
-    # XML formatındaki altyazıyı parçala
-    root = ElementTree.fromstring(sub_res.text)
-    segments = []
-    for text_el in root.findall(".//text"):
-        t = text_el.text or ""
-        # HTML karakterlerini temizle
-        t = t.replace("&quot;", '"').replace("&#39;", "'").replace("&amp;", "&").strip()
-        if t:
-            start = float(text_el.get("start", 0))
-            dur = float(text_el.get("dur", 2))
-            segments.append({
-                "start": round(start, 1),
-                "end": round(start + dur, 1),
-                "text": t
-            })
-            
-    if not segments:
-        raise Exception("Altyazı metni boş döndü.")
-    return segments
+    # İşi biten ses dosyasını sil
+    if os.path.exists(audio_file):
+        os.remove(audio_file)
+
+    return transcription.segments
 
 def find_best_segment(transcript_segments):
-    """Gemini ile en etkileyici 35-50 saniyelik aralığı seçer."""
+    """Gemini ile en vurucu 35-50 saniyelik kesiti bulur."""
+    # Metin parçalarını kompakt hale getir
+    condensed = [{"start": round(s["start"], 1), "end": round(s["end"], 1), "text": s["text"]} for s in transcript_segments[:500]]
+    
     prompt = f"""
     Sen tecrübeli bir sosyal medya editörüsün. Aşağıdaki metin Siyer Vakfı dersine aittir.
     Instagram Reels formatına en uygun, çarpıcı, öğüt verici, duygu yoğunluğu yüksek ve tek başına dinlendiğinde anlamlı olan 35-50 saniyelik kesiti seç.
 
-    Transkript parçaları:
-    {json.dumps(transcript_segments[:500], ensure_ascii=False)}
+    Transkript:
+    {json.dumps(condensed, ensure_ascii=False)}
 
     SADECE şu JSON şablonunda cevap ver:
     {{"start": 120.0, "end": 165.0, "reason": "Kesitin seçilme gerekçesi"}}
@@ -98,7 +90,7 @@ def find_best_segment(transcript_segments):
     return json.loads(response.text)
 
 def download_and_crop(video_id, start, end, output_filename="reels.mp4"):
-    """Videonun o aralığını Android API kimliğiyle indirip 9:16 dikey kırpar."""
+    """Sadece seçilen aralığı dikey (9:16) formatta indirir."""
     if os.path.exists(output_filename):
         os.remove(output_filename)
 
@@ -107,7 +99,7 @@ def download_and_crop(video_id, start, end, output_filename="reels.mp4"):
     
     cmd = [
         "yt-dlp",
-        "--extractor-args", "youtube:player_client=android",
+        "--extractor-args", "youtube:player_client=android_creator,android",
         "--download-sections", f"*{start}-{end}",
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4/best",
         "--postprocessor-args", f"ffmpeg:-vf {filter_complex}",
@@ -129,11 +121,11 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Geçerli bir YouTube linki tespit edilemedi kral.")
         return
 
-    status_msg = await update.message.reply_text("⚡ Konuşma metni taranıyor...")
+    status_msg = await update.message.reply_text("🎙️ Ses indiriliyor ve Groq Whisper ile dinleniyor...")
     
     try:
-        # 1. Doğrudan YouTube'dan Altyazı Çekme
-        segments = get_transcript_direct(video_id)
+        # 1. Groq ile doğrudan sesi dinleyip metne dökme
+        segments = get_audio_and_transcribe(video_id)
         await status_msg.edit_text("🤖 Gemini en etkili kesiti seçiyor...")
         
         # 2. Vurucu Kesiti Bulma
